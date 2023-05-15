@@ -4,26 +4,28 @@
 # # Momentum Calibration for Text Generation
 # https://arxiv.org/abs/2212.04257
 
-from torch.nn import CrossEntropyLoss
-from transformers import get_scheduler
-from torch.optim import AdamW
-from datetime import datetime
 import copy
+from datetime import datetime
 
-from tqdm import tqdm
 import numpy as np
 import torch
-from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.optim import AdamW
 from datasets import load_dataset
-import transformers
-from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq, AutoTokenizer, pipeline
-from transformers.models.bart.modeling_bart import shift_tokens_right
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+    DataCollatorForSeq2Seq,
+    AutoTokenizer,
+    pipeline,
+    get_scheduler
+)
 import evaluate
-from evaluate import evaluator
+
+from util import RunningStats
 
 get_ipython().run_line_magic('env', 'CUDA_DEVICE_ORDER=PCI_BUS_ID')
-get_ipython().run_line_magic('env', 'CUDA_VISIBLE_DEVICES=0,1')
+get_ipython().run_line_magic('env', 'CUDA_VISIBLE_DEVICES=1,2')
 # get_ipython().run_line_magic('env', 'CUDA_LAUNCH_BLOCKING=1')
 
 # load dataset
@@ -117,7 +119,7 @@ checkpoint_dir = './checkpoints'
 vocab_size = tokenizer.vocab_size
 pad_token_id = tokenizer.pad_token_id
 eos_token_id = tokenizer.eos_token_id
-pred_max_length = 142
+MAX_SUM_LEN = 142
 n_samples = 8
 
 
@@ -130,13 +132,24 @@ lambda_param = 0.001
 alpha = 2.0
 beta = 0.1
 m = 0.995
+UNIFORM_WEIGHTING = True
+
+
+series = torch.arange(1, MAX_SUM_LEN + 1).to(DEVICE_0)
+series = torch.cumsum(1 / series ** 2, 0)
 
 
 def loss_fct(logits, labels):
     output = torch.log_softmax(logits, axis=-1)
     scores = torch.gather(output, 1, labels.unsqueeze(-1)).squeeze(-1)
     label_mask = (labels != pad_token_id).float()
-    return -(scores * label_mask).sum(-1) / (label_mask).sum(-1) ** alpha
+    if UNIFORM_WEIGHTING:
+        return -(scores * label_mask).sum(-1) / (label_mask).sum(-1) ** alpha
+    sum_len = label_mask.sum(-1)
+    t = torch.arange(1, sum_len + 1, device=DEVICE_0)
+    y_t_tilde = 1 / (sum_len + 1 - t) ** 2
+    y_t = y_t_tilde * sum_len / series[sum_len]
+    return -(scores[:sum_len] * y_t).sum(-1) / sum_len ** alpha
 
 
 training_args = Seq2SeqTrainingArguments(
@@ -179,6 +192,7 @@ dataset = shuffle_dataset(tokenized_test)
 for epoch in range(NUM_EPOCHS):
     print(f'### Epoch {epoch}')
     total_pr_loss, total_mle_loss, total_loss = 0, 0, 0
+    stats = RunningStats()
     for step in range(NUM_STEP_PER_EPOCH):
         inputs = next(dataset)
 
@@ -192,7 +206,7 @@ for epoch in range(NUM_EPOCHS):
         # generate samples
         summarizer.model.to(DEVICE_1)
         samples = gen_samples(
-            summarizer, inputs['article'], return_tensors=True)
+            summarizer, inputs['article'], n_samples, return_tensors=True)
 
         # calculate the rouge score for each sample
         labels = inputs['labels']
@@ -200,7 +214,11 @@ for epoch in range(NUM_EPOCHS):
         for sample in samples:
             score = compute_metrics(([sample], [labels]))
             rouge_scores.append(use_metrics(score))
-        samples = [sample for score, sample in
+        stats.add(rouge_mean=np.mean(rouge_scores),
+                  rouge_std=np.std(rouge_scores),
+                  rouge_min=np.min(rouge_scores),
+                  rouge_max=np.max(rouge_scores))
+        samples = [sample for _, sample in
                    sorted(zip(rouge_scores, samples), key=lambda x: x[0])]
 
         # forward pass
@@ -248,11 +266,17 @@ for epoch in range(NUM_EPOCHS):
             ))
             optimizer.step()
             optimizer.zero_grad()
+            # lr_scheduler.step()
+            stats.add(pairwise_ranking_loss=total_pr_loss,
+                      mle_loss=total_mle_loss,
+                      loss=total_loss)
             total_pr_loss, total_mle_loss, total_loss = 0, 0, 0
 
     # update G
     for G_param, M_param in zip(G.parameters(), M.parameters()):
         G_param.data.copy_(m * M_param.data + (1.0 - m) * M_param.data)
+        M_param.data.copy_(G_param.data)
+    M.to(DEVICE_0)
     G.to(DEVICE_1)
 
     summarizer = pipeline("summarization", model=G,
@@ -270,4 +294,6 @@ for epoch in range(NUM_EPOCHS):
     )
 
     metrics = trainer.evaluate(sample_testset)
-    print(metrics)
+    print('[Model G]', metrics)
+
+    stats.flush_summary()
